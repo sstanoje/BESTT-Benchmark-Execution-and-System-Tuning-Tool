@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -u
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${ROOT_DIR}" || exit 1
+
+missing=0
+
+need_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required dependency: $1" >&2
+    missing=1
+  fi
+}
+
+warn_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Optional dependency not found: $1 ($2)" >&2
+  fi
+}
+
+need_command python3
+need_command bash
+need_command sudo
+
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import tkinter
+PY
+  then
+    echo "Missing required dependency: Python Tkinter module (install python3-tk on Debian/Ubuntu)" >&2
+    missing=1
+  fi
+fi
+
+if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  echo "Missing graphical display: DISPLAY or WAYLAND_DISPLAY is not set" >&2
+  missing=1
+fi
+
+warn_command systemctl "needed for NTP status/actions and reboot"
+warn_command taskset "needed for program core pinning"
+warn_command numactl "needed for program NUMA pinning"
+
+if ! command -v update-grub >/dev/null 2>&1 && ! command -v grub2-mkconfig >/dev/null 2>&1; then
+  echo "Optional dependency not found: update-grub or grub2-mkconfig (needed to regenerate GRUB automatically)" >&2
+fi
+
+if [ "${missing}" -ne 0 ]; then
+  echo "Cannot start BESTT GUI until required dependencies are installed." >&2
+  exit 1
+fi
+
+exec python3 -m BESTT

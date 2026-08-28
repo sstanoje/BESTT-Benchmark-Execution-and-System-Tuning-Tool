@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bestt"
+version = "1.0.0"
+description = "Benchmark execution and Linux system tuning tool for reproducible benchmarking"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+  {name = "Strahinja Stanojevic"}
+]
+keywords = ["benchmarking", "reproducibility", "performance", "gui"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: X11 Applications",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Testing"
+]
+
+[project.scripts]
+BESTT = "BESTT.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["BESTT*"]
+
+[tool.setuptools.package-data]
+BESTT = ["scripts/*.sh", "scripts/*.py"]
