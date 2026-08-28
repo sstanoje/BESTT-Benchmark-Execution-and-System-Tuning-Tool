@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bestt"
-version = "1.0.0"
+version = "1.0.2"
 description = "Benchmark execution and Linux system tuning tool for reproducible benchmarking"
 readme = "README.md"
 requires-python = ">=3.8"

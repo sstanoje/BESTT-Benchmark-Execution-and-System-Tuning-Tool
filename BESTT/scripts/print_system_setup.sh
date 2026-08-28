@@ -81,7 +81,7 @@ cstate="$(read_or_unknown /sys/module/intel_idle/parameters/max_cstate)"
 if [ "${cstate}" = "0" ]; then
   cstates="disabled"
 elif grep -qw 'intel_idle.max_cstate=0' /proc/cmdline 2>/dev/null; then
-  cstates="pending reboot"
+  cstates="unknown"
 else
   cstates="enabled"
 fi

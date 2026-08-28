@@ -12,6 +12,7 @@ The application is intended for benchmarking experiments where the system config
 - Python 3.8 or newer
 - Tkinter, usually available as `python3-tk`
 - `sudo`
+- `flock` (util-linux), required for system setup and restoration
 - Permission to change system settings
 
 Optional tools are used only by specific features:
@@ -135,7 +136,7 @@ Command pattern:
 sudo -A bash BESTT/scripts/setup_system_for_benchmarking.sh --all <core>
 ```
 
-This action changes boot-time settings and requires a reboot.
+This action checks boot-time settings and requests a reboot only when the configured parameters are not already active.
 
 ### Setup MTR
 
@@ -159,29 +160,46 @@ Command:
 sudo -A bash BESTT/scripts/setup_system_for_benchmarking.sh --mt-rec
 ```
 
-This action changes boot-time settings and requires a reboot.
+This action checks boot-time settings and requests a reboot only when the configured parameters are not already active.
 
-### Restore Common Defaults
+### Restore Previous Settings
 
-Restores common default system behavior as a best-effort operation.
+Before the first setup action, BESTT saves supported settings in the root-owned
+`/var/lib/bestt/original-state.json`, including original managed GRUB parameters.
+Later actions keep this snapshot, including across GUI restarts and reboots.
+Snapshot read/write errors stop setup before any settings change. Actions are
+serialized using `flock` (util-linux).
 
-It performs the following actions:
+Restoration uses the saved boost state, SMT state, per-CPU governors, ASLR value,
+and time-service running states. Unsupported settings are skipped. Each restore
+step is attempted independently. A failed restoration keeps the snapshot for a
+retry. If GRUB restoration requires a reboot, BESTT keeps the snapshot. After
+rebooting, run `Restore Previous Settings` again to restore runtime settings that
+may have reset during boot. The snapshot is removed only after this succeeds.
+If no reboot is needed, successful restoration removes the snapshot immediately.
+Without a snapshot, restoration shows a friendly warning and makes no changes.
 
-- enables Turbo Boost
-- restores a common CPU governor such as `schedutil`, `ondemand`, or the first available governor
-- enables ASLR
-- enables Hyper-Threading
-- enables swap memory
-- restarts common time synchronization services (NTP)
-- removes BESTT GRUB arguments
+- Cleared caches cannot be restored.
+- Swap is restored only as enabled/disabled using `swapon -a` or `swapoff -a`;
+  the exact original swap devices are not saved. If configured swap cannot be
+  enabled, restoration reports a failure.
+- GRUB restoration removes only parameters BESTT changed and reinstates their
+  original values. Unrelated parameters, comments and other GRUB settings are
+  preserved. Already-matching parameters are not recorded as changes. Manual
+  edits to parameters BESTT changed are replaced by their original values.
+  An assignment added by BESTT is removed on restoration if no unrelated
+  arguments remain. Duplicate `GRUB_CMDLINE_LINUX` assignments are rejected.
+  GRUB writes are atomic and preserve file permissions and ownership.
+  GRUB is regenerated after changes; reboot before starting a new setup after
+  restoring boot-time settings.
+- The snapshot is the state before BESTT first modifies the machine, not factory
+  defaults. Settings changed before this feature was installed cannot be recovered.
 
 Command:
 
 ```bash
 sudo -A bash BESTT/scripts/setup_system_for_benchmarking.sh --restore
 ```
-
-This action can require a reboot when boot-time settings are changed.
 
 ## 8. Advanced Action Buttons
 
@@ -217,7 +235,7 @@ Command:
 sudo -A bash BESTT/scripts/setup_system_for_benchmarking.sh --cstates
 ```
 
-This action requires a reboot.
+A reboot is required only when the configured boot parameters are not already active.
 
 ### Disable ASLR
 
@@ -279,7 +297,7 @@ Command pattern:
 sudo -A bash BESTT/scripts/setup_system_for_benchmarking.sh --isolate <core>
 ```
 
-This action requires a reboot.
+A reboot is required only when the configured boot parameters are not already active.
 
 ## 9. Bottom Control Buttons
 
@@ -289,7 +307,7 @@ Runs the currently selected profile or advanced action.
 
 Before execution, the application opens a confirmation popup showing the exact command that will be executed.
 
-For actions that require a reboot, the confirmation popup also states that boot-time settings are changed.
+For actions affecting boot-time settings, the confirmation popup explains that a reboot may be needed.
 
 ### Refresh Status
 
@@ -365,15 +383,13 @@ Possible values:
 
 - `enabled`
 - `disabled`
-- `pending reboot`
 - `unknown`
 
 Meaning:
 
 - `enabled`: deeper CPU sleep states are allowed. They save power but can add wake-up latency.
 - `disabled`: deeper CPU sleep states are prevented, reducing wake-up latency variability.
-- `pending reboot`: boot settings were changed, but the active kernel state has not changed yet.
-- `unknown`: the GUI could not determine the C-state status.
+- `unknown`: the GUI could not verify the active C-state configuration, even if the boot arguments are present.
 
 ### Hyper-Threading
 
@@ -435,13 +451,13 @@ Possible values:
 
 - `none`
 - a core list, for example `3`
-- `pending reboot`
+- `unknown`
 
 Meaning:
 
 - `none`: no CPU core is isolated for benchmark execution.
 - a core list: listed core or cores are isolated from normal scheduler activity.
-- `pending reboot`: core isolation was configured in boot settings but is not active yet.
+- `unknown`: active CPU isolation could not be verified, or its status interface is unavailable.
 
 ## 12. Run Program Panel
 
@@ -602,6 +618,8 @@ sudo -A systemctl reboot
 
 If declined, the system remains running and the user must reboot manually later.
 
+After rebooting, launch BESTT again and inspect the displayed system configuration. Some runtime-controlled settings may return to the state defined by the system firmware or BIOS after reboot. If any such setting is not in the desired state, run the selected setup profile again, or apply the required changes individually through the tool GUI, before collecting benchmark measurements. If the boot-time settings are already shown as applied after the reboot, no additional reboot is needed, even if the selected profile includes actions that normally require a reboot.
+
 ## 16. Output Panel
 
 The output panel shows:
@@ -613,6 +631,10 @@ The output panel shows:
 - standard error from programs started through `Run Program`
 - exit code
 - reboot-related messages
+
+For configuration actions, `[UNCHANGED]` means the setting is already correct;
+`[OK]` means a change or operation completed successfully. `[REBOOT REQUIRED]`
+means configured boot-time parameters are not yet active in the running kernel.
 
 The output panel is read-only.
 
@@ -649,18 +671,93 @@ The following actions can require a reboot:
 
 - `Setup R`
 - `Setup MTR`
-- `Restore Common Defaults`
+- `Restore Previous Settings`
 - `Disable C-states`
 - `Isolate Core`
 
-The GUI prompts for reboot after successful execution of these actions.
+The GUI prompts for reboot only if the configured boot parameters are not already active.
 
 ## 19. Notes and Limitations
 
 - The application is intended for Linux systems.
 - Some settings depend on CPU, kernel, and distribution support.
 - C-state and core-isolation settings are applied through GRUB and require reboot.
-- The status table reflects the currently active system state. Boot-time changes may appear as `pending reboot`.
+- The status table describes the running system; unverified C-state or CPU-isolation settings appear as `unknown`. Setup actions report reboot requirements separately.
 - Setup actions use fixed predefined commands.
 - The program runner executes a selected executable as an argument list, not through a shell command string.
 - The exported report records system state, not benchmark results.
+
+### Platform Compatibility
+
+BESTT is designed for Linux systems but is not restricted to Ubuntu-based distributions. However, some controls depend on the processor, kernel, installed utilities, and system services.
+
+- Turbo Boost control requires the Intel-specific `intel_pstate/no_turbo` interface and is unavailable on systems without it.
+- C-state configuration uses the `intel_idle.max_cstate` and `processor.max_cstate` kernel parameters, which depend on the supported CPU idle drivers.
+- CPU governors, SMT, ASLR, swap, and CPU-affinity controls may work on non-Intel processors where the corresponding Linux interfaces are supported.
+- Boot-time settings require `/etc/default/grub` and either `update-grub` or `grub2-mkconfig`.
+- Time-synchronization controls support specific services, primarily managed through systemd.
+
+Unsupported settings or missing utilities are reported, and remaining independent operations are attempted. Complete application of the R and MTR configurations is therefore not guaranteed on unsupported systems. Users should verify the active system configuration before benchmarking. BESTT also reports whether system configuration or restoration was completed successfully or only partially.
+
+### Safety Considerations
+
+- BESTT modifies system-level settings and should be used with administrator privileges only when necessary.
+- Disabling ASLR reduces system security protections.
+- Disabling swap may increase the risk of out-of-memory conditions.
+- Stopping time synchronization may cause clock drift.
+- Changing SMT, CPU governors, or core isolation may affect system performance.
+- Incorrect GRUB configuration changes may prevent the system from booting normally.
+- Unsupported or failed configuration actions are reported, while independent actions continue. A partially applied configuration should not be used for benchmarking without verification.
+- Users should inspect the active configuration before benchmarking and restore previous settings afterward using `Restore Previous Settings`.
+
+
+## 20. Complete Benchmarking Workflow
+
+This section describes how to use BESTT to configure a Linux system, execute a benchmark, document the environment, and restore the original settings.
+
+### 1. Prepare the system
+
+Launch BESTT and inspect the current system configuration.
+
+Select the appropriate predefined configuration (`Setup R` or `Setup MTR`), or configure individual settings according to the benchmarking requirements, click `Run Selected Action`, and confirm execution.
+
+### 2. Reboot and verify
+
+If the requested boot-time settings are not already active in the running kernel, BESTT displays a reboot prompt, even when the GRUB configuration file is already correct. The user can choose to reboot immediately through the GUI or reboot manually later.
+
+After rebooting, launch BESTT again and verify the displayed system configuration. Reapply any required runtime settings that did not persist across the reboot.
+
+If no reboot is required, the `Refresh Status` button can be used to verify the applied settings.
+
+Reapplying an already configured and active profile reports `[UNCHANGED]` for its settings and does not request another reboot. Cache clearing still runs when requested. If the GRUB configuration is correct but the running kernel parameters differ, BESTT still reports `[REBOOT REQUIRED]`. Failed GRUB regeneration is retried.
+
+### 3. Configure benchmark execution
+
+In the `Run Program` panel:
+
+- Select the executable and working directory.
+- Provide any required command-line arguments and runtime options.
+- Optionally enable elevated privileges, elevated process priority, CPU-core pinning, or NUMA-node binding.
+
+Review the generated execution command in the command preview.
+
+### 4. Execute the benchmark
+
+Click `Run Program` and confirm execution.
+
+BESTT displays the benchmark's output and exit code in the output panel.
+
+Benchmark outputs must be saved separately when needed, as BESTT does not automatically store them in result files.
+
+### 5. Document the configuration
+
+Click `Export Report` to save the current system configuration as a JSON file. The default save directory is the working directory selected in the `Run Program` panel.
+
+### 6. Restore the system
+
+After benchmarking, select `Restore Previous Settings`, click `Run Selected Action`, and confirm execution.
+
+BESTT attempts to restore the supported original system settings saved before configuration changes.
+
+If a reboot is required, reboot and run `Restore Previous Settings` again to
+finish runtime restoration. Then verify the restored configuration.

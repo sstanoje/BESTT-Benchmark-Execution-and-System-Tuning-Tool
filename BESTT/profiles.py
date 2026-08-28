@@ -45,12 +45,13 @@ ACTION_SPECS: Dict[str, ActionSpec] = {
     ),
     "restore_defaults": ActionSpec(
         key="restore_defaults",
-        label="Restore Common Defaults",
+        label="Restore Previous Settings",
         category="Profiles",
         script_args=("--restore",),
         requires_reboot=True,
         description=(
-            "Restore system to its default state."
+            "Restore settings saved before the first setup action. Cleared caches cannot be restored. "
+            "Only GRUB parameters changed by BESTT are restored; unrelated edits are preserved."
         ),
     ),
     "turbo": ActionSpec(

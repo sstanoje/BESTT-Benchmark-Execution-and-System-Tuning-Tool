@@ -151,8 +151,8 @@ def _cstate_status() -> StatusItem:
 
     if intel_idle == "0" or processor == "0":
         return StatusItem("C-states", "disabled", f"intel_idle={intel_idle}, processor={processor}")
-    if "intel_idle.max_cstate=0" in cmdline or "processor.max_cstate=0" in cmdline:
-        return StatusItem("C-states", "pending reboot", "GRUB argument present")
+    if "intel_idle.max_cstate=0" in cmdline.split() or "processor.max_cstate=0" in cmdline.split():
+        return StatusItem("C-states", "unknown", "Boot arguments are present, but their effect could not be verified")
     if intel_idle is not None or processor is not None:
         return StatusItem("C-states", "enabled", f"intel_idle={intel_idle}, processor={processor}")
     return StatusItem("C-states", "unknown", "kernel module parameter not available")
@@ -200,7 +200,9 @@ def _isolated_cores_status() -> StatusItem:
     cmdline = _read_text("/proc/cmdline") or ""
     for token in cmdline.split():
         if token.startswith("isolcpus="):
-            return StatusItem("Isolated Cores", "pending reboot", token)
+            return StatusItem("Isolated Cores", "unknown", f"Boot argument {token} is present, but isolation could not be verified")
+    if value is None:
+        return StatusItem("Isolated Cores", "unknown", "CPU isolation interface unavailable")
     return StatusItem("Isolated Cores", "none", "")
 
 
@@ -243,7 +245,7 @@ def _with_explanation(item: StatusItem) -> StatusItem:
         "C-states": {
             "enabled": "Allows deeper CPU sleep states, which save power but can add wake-up latency.",
             "disabled": "Prevents deeper CPU sleep states, reducing wake-up latency variability.",
-            "pending reboot": "Boot settings were changed, but the active kernel state has not changed yet.",
+            "unknown": "The active C-state configuration could not be verified.",
         },
         "ASLR": {
             "enabled": "Randomizes memory layout between runs, improving security but adding layout variation.",
@@ -259,7 +261,7 @@ def _with_explanation(item: StatusItem) -> StatusItem:
         },
         "Isolated Cores": {
             "none": "No CPU core is isolated for benchmark execution.",
-            "pending reboot": "Core isolation was configured in boot settings but is not active yet.",
+            "unknown": "Active CPU isolation could not be verified.",
         },
     }
     explanation = explanations.get(item.setting, {}).get(item.value)
