@@ -602,6 +602,8 @@ sudo -A systemctl reboot
 
 If declined, the system remains running and the user must reboot manually later.
 
+After rebooting, click `Refresh Status` to check the active system state. Some runtime-controlled settings may return to the state defined by the system firmware or BIOS after reboot. If any such setting is not in the desired state, run the selected setup profile again, or apply the required changes individually through the tool GUI, before collecting benchmark measurements. If the boot-time settings are already shown as applied after the reboot, no additional reboot is needed, even if the selected profile includes actions that normally require a reboot.
+
 ## 16. Output Panel
 
 The output panel shows:
