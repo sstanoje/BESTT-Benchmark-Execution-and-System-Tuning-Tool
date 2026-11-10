@@ -636,6 +636,7 @@ class BESTT(tk.Tk):
             title="Export current configuration report",
             defaultextension=".json",
             filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            initialdir=self.program_workdir_var.get().strip() or os.getcwd(),
             initialfile="BESTT-report.json",
         )
         if not path:
@@ -867,13 +868,14 @@ class BESTT(tk.Tk):
         preview = command_preview(command)
 
         message = f"Run this action?\n\nExact command:\n{preview}"
+        message += "\n\nFailed or unsupported settings are reported in the output; remaining settings continue."
         if action.requires_reboot:
             message += "\n\nThis action changes boot-time settings and requires a reboot."
         if not self._ask_responsive_dialog("Confirm Action", action.label, message, "Run", "Cancel"):
             return
 
         self._append_log(f"$ {preview}\n")
-        worker = threading.Thread(target=self._run_in_background, args=(command,), daemon=True)
+        worker = threading.Thread(target=self._run_in_background, args=(command, action_key), daemon=True)
         worker.start()
         self.after(150, self._poll_result_queue)
 
@@ -897,10 +899,10 @@ class BESTT(tk.Tk):
         worker.start()
         self.after(150, self._poll_result_queue)
 
-    def _run_in_background(self, command) -> None:
+    def _run_in_background(self, command, action_key) -> None:
         try:
             result = run_action_command(command)
-            self.result_queue.put(("action_result", result))
+            self.result_queue.put(("action_result", (action_key, result)))
         except Exception as exc:
             self.result_queue.put(("error", exc))
 
@@ -923,6 +925,8 @@ class BESTT(tk.Tk):
             messagebox.showerror("Action Failed", str(payload))
             return
 
+        if kind == "action_result":
+            action_key, payload = payload
         result = payload
         if result.stdout:
             self._append_log(result.stdout)
@@ -947,24 +951,36 @@ class BESTT(tk.Tk):
         self.refresh_status()
 
         if result.ok:
-            action = get_action(self.selected_action_key.get())
-            if action.requires_reboot:
-                self._offer_reboot(action.label)
+            action = get_action(action_key)
+            if action.requires_reboot and "GRUB updated. Reboot required." in result.stdout:
+                self._offer_reboot(action.label, restoring=action_key == "restore_defaults")
             else:
                 messagebox.showinfo("Action Complete", "Action completed.")
+        elif action_key == "restore_defaults" and "[WARN] Nothing to restore." in result.stdout:
+            messagebox.showwarning("Nothing to Restore", result.stdout.replace("[WARN] ", "", 1).strip())
+        elif "Result: PARTIALLY" in result.stdout:
+            summary = next(line for line in result.stdout.splitlines() if line.startswith("Result: PARTIALLY"))
+            messagebox.showwarning(
+                "Action Incomplete",
+                f"{summary}\n\nSee the output for failed or unsupported settings. "
+                "Verify the system configuration before benchmarking. "
+                + ("Resolve GRUB errors before rebooting." if "[CRITICAL]" in result.stdout else
+                   "If GRUB was successfully updated, reboot for boot-time changes to take effect."),
+            )
         else:
             messagebox.showerror("Action Failed", f"Action exited with code {result.returncode}.")
 
-    def _offer_reboot(self, action_label: str) -> None:
+    def _offer_reboot(self, action_label: str, restoring: bool = False) -> None:
         command = build_reboot_command(privilege="sudo")
         preview = command_preview(command)
         should_reboot = self._ask_responsive_dialog(
             "Reboot Required",
             "Reboot required",
             (
-                f"{action_label} completed successfully. "
-                "A reboot is required for boot-time settings to take effect.\n\n"
-                f"Reboot now?\n\nExact command:\n{preview}"
+                f"{action_label}: boot-time changes are ready. "
+                "A reboot is required for them to take effect.\n\n"
+                + ("After rebooting, run Restore Previous Settings again to finish restoring runtime settings.\n\n" if restoring else "")
+                + f"Reboot now?\n\nExact command:\n{preview}"
             ),
             "Reboot now",
             "Later",

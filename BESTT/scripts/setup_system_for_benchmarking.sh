@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 if [ "${EUID}" -ne 0 ]; then
   echo "Please run as root (use sudo or pkexec)." >&2
@@ -8,7 +8,30 @@ fi
 
 ISOLATED_CORE="${2:-3}"
 GRUB_FILE="/etc/default/grub"
-GRUB_BACKUP="/etc/default/grub.bestt.bak"
+STATE_FILE="/var/lib/bestt/original-state.json"
+STATE_HELPER="$(dirname "${BASH_SOURCE[0]}")/original_state.py"
+
+failures=0
+
+# Each independent step reports its result and lets the next step run.
+run_step() {
+  local label="$1"
+  shift
+  if "$@"; then
+    echo "[OK] ${label}"
+  else
+    failures=$((failures + 1))
+    if [[ "${label}" == GRUB* ]]; then
+      echo "[CRITICAL] ${label} failed; boot settings were not fully applied."
+    else
+      echo "[WARN] ${label} failed or is unsupported; continuing."
+    fi
+  fi
+}
+
+write_value() {
+  echo "$1" > "$2"
+}
 
 show_help() {
   cat <<'HELP'
@@ -28,7 +51,7 @@ Options:
   -i, --isolate        Add GRUB core-isolation settings for CORE_NUMBER
   -M, --mt-rec         Apply MTR profile
   -a, --all            Apply R profile for CORE_NUMBER
-  -r, --restore        Best-effort restore of common defaults
+  -r, --restore        Restore saved previous settings
   -h, --help           Show this help
 HELP
 }
@@ -45,18 +68,39 @@ available_governor() {
   return 1
 }
 
+# Expand the kernel's online CPU list (for example, 0-2,6,8).
+online_cpus() {
+  local online part
+  local parts=()
+  online="$(cat /sys/devices/system/cpu/online)" || return 1
+  [ -n "${online}" ] || return 1
+  IFS=',' read -ra parts <<< "${online}"
+  for part in "${parts[@]}"; do
+    if [[ "${part}" == *-* ]]; then
+      seq "${part%-*}" "${part#*-}" || return 1
+    else
+      printf '%s\n' "${part}"
+    fi
+  done
+}
+
 set_governor_all() {
   local preferred="$1"
-  local cpu_count
-  cpu_count="$(nproc)"
+  local failed=0
+  local cpus cpu
+  cpus="$(online_cpus)" || return 1
 
-  for cpu in $(seq 0 $((cpu_count - 1))); do
+  for cpu in ${cpus}; do
     local fallback=""
     local governor_file="/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor"
-    [ -f "${governor_file}" ] || continue
+    if [ ! -f "${governor_file}" ]; then
+      echo "[WARN] CPU ${cpu}: governor control unavailable."
+      failed=1
+      continue
+    fi
 
     if available_governor "${cpu}" "${preferred}" >/dev/null; then
-      echo "${preferred}" > "${governor_file}"
+      echo "${preferred}" > "${governor_file}" || failed=1
       continue
     fi
 
@@ -67,16 +111,19 @@ set_governor_all() {
       fi
     done
 
+    echo "[WARN] CPU ${cpu}: ${preferred} unavailable; fallback: ${fallback:-none}."
+    failed=1
     if [ -n "${fallback}" ]; then
-      echo "${fallback}" > "${governor_file}"
+      echo "${fallback}" > "${governor_file}" || failed=1
     fi
   done
+  return "${failed}"
 }
 
 tune_performance() {
   echo "--- Setting performance mode ---"
-  disable_turbo
-  set_governor_all performance
+  run_step "Disable Turbo Boost" disable_turbo
+  run_step "CPU governors" set_governor_all performance
 }
 
 disable_turbo() {
@@ -85,29 +132,30 @@ disable_turbo() {
     echo "1" > /sys/devices/system/cpu/intel_pstate/no_turbo
   else
     echo "Turbo Boost control is not available on this machine."
+    return 1
   fi
 }
 
 tune_governor() {
   local governor="$1"
   echo "--- Setting scaling governors to ${governor} ---"
-  set_governor_all "${governor}"
+  run_step "CPU governors" set_governor_all "${governor}"
 }
 
 tune_memory() {
   echo "--- Cleaning memory state ---"
-  disable_swap
-  clear_caches
+  run_step "Disable swap" disable_swap
+  run_step "Clear caches" clear_caches
 }
 
 disable_swap() {
   echo "--- Disabling swap ---"
-  swapoff -a || true
+  swapoff -a
 }
 
 clear_caches() {
   echo "--- Clearing filesystem caches ---"
-  sync
+  sync || return 1
   echo "3" > /proc/sys/vm/drop_caches
 }
 
@@ -122,84 +170,38 @@ tune_topology() {
     echo off > /sys/devices/system/cpu/smt/control
   else
     echo "Hyper-Threading control is not available on this machine."
+    return 1
   fi
 }
 
 enable_topology() {
   echo "--- Enabling Hyper-Threading when supported ---"
   if [ -f "/sys/devices/system/cpu/smt/control" ]; then
-    echo on > /sys/devices/system/cpu/smt/control || true
+    echo on > /sys/devices/system/cpu/smt/control
   else
     echo "Hyper-Threading control is not available on this machine."
+    return 1
   fi
 }
 
 tune_ntp() {
-  echo "--- Stopping time synchronization services ---"
-  systemctl stop systemd-timesyncd 2>/dev/null || true
-  systemctl stop chronyd 2>/dev/null || true
-  systemctl stop ntp 2>/dev/null || true
-  service ntp stop 2>/dev/null || true
-}
-
-ensure_grub_backup() {
-  [ -f "${GRUB_FILE}" ] || {
-    echo "Missing ${GRUB_FILE}; cannot update GRUB." >&2
-    exit 1
-  }
-  if [ ! -f "${GRUB_BACKUP}" ]; then
-    cp "${GRUB_FILE}" "${GRUB_BACKUP}"
-    echo "Created ${GRUB_BACKUP}"
-  fi
-}
-
-current_grub_args() {
-  sed -n 's/^GRUB_CMDLINE_LINUX="\([^"]*\)".*/\1/p' "${GRUB_FILE}" | tail -n 1
-}
-
-remove_managed_grub_args() {
-  local current="$1"
-  local mode="$2"
-  local filtered=()
-
-  for token in ${current}; do
-    case "${token}" in
-      processor.max_cstate=*|intel_idle.max_cstate=*)
-        [ "${mode}" = "isolation" ] && filtered+=("${token}")
-        ;;
-      isolcpus=*|nohz_full=*|rcu_nocbs=*|irqaffinity=*)
-        [ "${mode}" = "cstates" ] && filtered+=("${token}")
-        ;;
-      *)
-        filtered+=("${token}")
-        ;;
-    esac
+  local operation="${1:-stop}"
+  local found=0
+  local name
+  for name in systemd-timesyncd chronyd ntp; do
+    if [ "$(systemctl show "$name" -p LoadState --value 2>/dev/null)" = "loaded" ]; then
+      found=1
+      run_step "${operation} ${name}" systemctl "$operation" "$name"
+    fi
   done
-
-  printf '%s\n' "${filtered[*]:-}"
-}
-
-write_grub_args() {
-  local args="$1"
-  python3 - "$GRUB_FILE" "$args" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-args = sys.argv[2]
-lines = path.read_text(encoding="utf-8").splitlines()
-written = False
-out = []
-for line in lines:
-    if line.startswith("GRUB_CMDLINE_LINUX="):
-        out.append(f'GRUB_CMDLINE_LINUX="{args}"')
-        written = True
-    else:
-        out.append(line)
-if not written:
-    out.append(f'GRUB_CMDLINE_LINUX="{args}"')
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
-PY
+  if [ "$found" -eq 0 ]; then
+    if [ -x /etc/init.d/ntp ]; then
+      run_step "${operation} ntp" service ntp "$operation"
+    else
+      echo "[WARN] No supported time-sync service found; no service changed."
+      failures=$((failures + 1))
+    fi
+  fi
 }
 
 regenerate_grub() {
@@ -212,48 +214,42 @@ regenerate_grub() {
       grub2-mkconfig -o /boot/grub/grub.cfg
     fi
   else
-    echo "WARNING: update-grub/grub2-mkconfig not found. Regenerate GRUB manually." >&2
+    echo "update-grub/grub2-mkconfig not found. Regenerate GRUB manually." >&2
+    return 1
   fi
 }
 
 apply_grub_args() {
-  local mode="$1"
-  shift
-  local additions=("$@")
-  ensure_grub_backup
-  local current
-  current="$(current_grub_args)"
-  local filtered
-  filtered="$(remove_managed_grub_args "${current}" "${mode}")"
-  local next="${filtered}"
-  for addition in "${additions[@]}"; do
-    if [ -z "${next}" ]; then
-      next="${addition}"
-    else
-      next="${next} ${addition}"
-    fi
-  done
-  write_grub_args "${next}"
-  regenerate_grub
+  local result
+  result="$(python3 "${STATE_HELPER}" grub-set "${STATE_FILE}" "${GRUB_FILE}" "$@")" || return 1
+  if [ "${result}" = unchanged ]; then
+    echo "GRUB parameters already match; no changes needed."
+    return 0
+  fi
+  regenerate_grub || {
+    echo "GRUB regeneration failed. Fix the error and regenerate GRUB before rebooting." >&2
+    return 1
+  }
   echo "GRUB updated. Reboot required."
 }
 
 isolation_args() {
   local target_core="$1"
-  local max_idx=$(( $(nproc) - 1 ))
-  local affinity
+  local cpus cpu
+  local found=0
+  local affinity=""
+  cpus="$(online_cpus)" || return 1
 
-  if [ "${target_core}" -lt 0 ] || [ "${target_core}" -gt "${max_idx}" ]; then
-    echo "Invalid core ${target_core}; valid range is 0-${max_idx}." >&2
-    exit 1
-  fi
-
-  if [ "${target_core}" -eq 0 ]; then
-    affinity="1-${max_idx}"
-  elif [ "${target_core}" -eq "${max_idx}" ]; then
-    affinity="0-$((max_idx - 1))"
-  else
-    affinity="0-$((target_core - 1)),$((target_core + 1))-${max_idx}"
+  for cpu in ${cpus}; do
+    if [ "${cpu}" = "${target_core}" ]; then
+      found=1
+    else
+      affinity="${affinity:+${affinity},}${cpu}"
+    fi
+  done
+  if [ "${found}" -eq 0 ] || [ -z "${affinity}" ]; then
+    echo "Invalid core ${target_core}; select an online CPU and leave another CPU available." >&2
+    return 1
   fi
 
   printf '%s\n' \
@@ -265,84 +261,136 @@ isolation_args() {
 
 tune_cstates_only() {
   echo "--- Disabling deep C-states through GRUB ---"
-  apply_grub_args cstates processor.max_cstate=0 intel_idle.max_cstate=0
+  run_step "GRUB C-states" apply_grub_args cstates processor.max_cstate=0 intel_idle.max_cstate=0
 }
 
 tune_mtr_grub() {
   echo "--- Applying MTR GRUB settings ---"
-  apply_grub_args all processor.max_cstate=0 intel_idle.max_cstate=0
+  run_step "GRUB MTR settings" apply_grub_args all processor.max_cstate=0 intel_idle.max_cstate=0
 }
 
 tune_isolation_only() {
   local target_core="$1"
   echo "--- Isolating core ${target_core} through GRUB ---"
-  mapfile -t args < <(isolation_args "${target_core}")
+  local output
+  output="$(isolation_args "${target_core}")" || return 1
+  local args=()
+  mapfile -t args <<< "${output}"
   apply_grub_args isolation "${args[@]}"
 }
 
 tune_full_grub() {
-  local target_core="$1"
-  echo "--- Applying C-state and core-isolation GRUB settings ---"
-  mapfile -t args < <(isolation_args "${target_core}")
-  apply_grub_args all processor.max_cstate=0 intel_idle.max_cstate=0 "${args[@]}"
+  tune_cstates_only
+  run_step "GRUB core isolation" tune_isolation_only "$1"
+}
+
+restore_value() {
+  local current
+  current="$(cat "$1")" || return 1
+  [ "${current}" = "$2" ] && return 0
+  write_value "$2" "$1" || return 1
+  [ "$(cat "$1")" = "$2" ]
+}
+
+restore_swap() {
+  if [ "$1" = on ]; then
+    swapon -a || return 1
+    # A manually activated swap device may not be configured in fstab.
+    [ "$(tail -n +2 /proc/swaps | wc -l)" -gt 0 ]
+  else
+    swapoff -a
+  fi
+}
+
+restore_grub() {
+  local result
+  result="$(python3 "${STATE_HELPER}" grub-restore "${STATE_FILE}" "${GRUB_FILE}")" || return 1
+  [ "${result}" = unchanged ] && return 0
+  if [ "${result}" != reboot ]; then
+    regenerate_grub || return 1
+    python3 "${STATE_HELPER}" grub-restored "${STATE_FILE}" "${GRUB_FILE}" || return 1
+  fi
+  echo "GRUB updated. Reboot required."
 }
 
 restore_defaults() {
-  echo "--- Restoring common defaults ---"
-  if [ -f "/sys/devices/system/cpu/intel_pstate/no_turbo" ]; then
-    echo "0" > /sys/devices/system/cpu/intel_pstate/no_turbo || true
+  if [ ! -f "${STATE_FILE}" ]; then
+    echo "[WARN] Nothing to restore. BESTT has no saved settings to restore. Apply a setup action first."
+    return 1
   fi
-  set_governor_all schedutil || true
-  echo "2" > /proc/sys/kernel/randomize_va_space || true
-  if [ -f "/sys/devices/system/cpu/smt/control" ]; then
-    echo on > /sys/devices/system/cpu/smt/control || true
-  fi
-  swapon -a || true
-  systemctl start systemd-timesyncd 2>/dev/null || true
-  systemctl start chronyd 2>/dev/null || true
-  systemctl start ntp 2>/dev/null || true
-
-  if [ -f "${GRUB_FILE}" ]; then
-    ensure_grub_backup
-    local current
-    current="$(current_grub_args)"
-    local filtered
-    filtered="$(remove_managed_grub_args "${current}" all)"
-    write_grub_args "${filtered}"
-    regenerate_grub
-    echo "Managed GRUB arguments removed. Reboot required."
+  local saved kind target value
+  saved="$(python3 "${STATE_HELPER}" restore "${STATE_FILE}" "${GRUB_FILE}")" || return 1
+  while IFS=$'\t' read -r kind target value; do
+    case "${kind}" in
+      value) run_step "Restore ${target}" restore_value "${target}" "${value}" ;;
+      swap) run_step "Restore swap" restore_swap "${target}" ;;
+      systemctl) run_step "Restore ${target}" systemctl "${value}" "${target}" ;;
+      service) run_step "Restore ${target}" service "${target}" "${value}" ;;
+      grub) run_step "GRUB restoration" restore_grub ;;
+    esac
+  done <<< "${saved}"
+  if [ "${failures}" -eq 0 ]; then
+    python3 "${STATE_HELPER}" finish-restore "${STATE_FILE}" "${GRUB_FILE}" || return 1
+  else
+    echo "Snapshot kept for retrying restoration."
   fi
 }
 
+# Validate the action before creating a snapshot. Help never changes state.
+case "${1:-}" in
+  -h|--help) show_help; exit 0 ;;
+  -r|--restore|-p|--performance|--turbo|--governor|--swap|--caches|-m|--memory|-s|--security|-t|--topology|-n|--ntp|-c|--cstates|-i|--isolate|-M|--mt-rec|-a|--all) ;;
+  *) show_help; exit 1 ;;
+esac
+
+# Keep concurrent GUI/CLI actions from overwriting or restoring the same snapshot.
+install -d -m 700 /var/lib/bestt || exit 1
+exec 9>/var/lib/bestt/lock || exit 1
+flock -n 9 || { echo "Another BESTT action is running (or flock is unavailable)." >&2; exit 1; }
+if [[ "${1}" != "-r" && "${1}" != "--restore" ]]; then
+  python3 "${STATE_HELPER}" save "${STATE_FILE}" "${GRUB_FILE}" || exit 1
+fi
+
 case "${1:-}" in
   -p|--performance) tune_performance ;;
-  --turbo) disable_turbo ;;
+  --turbo) run_step "Disable Turbo Boost" disable_turbo ;;
   --governor) tune_governor "${2:-performance}" ;;
-  --swap) disable_swap ;;
-  --caches) clear_caches ;;
+  --swap) run_step "Disable swap" disable_swap ;;
+  --caches) run_step "Clear caches" clear_caches ;;
   -m|--memory) tune_memory ;;
-  -s|--security) tune_security ;;
-  -t|--topology) tune_topology ;;
+  -s|--security) run_step "Disable ASLR" tune_security ;;
+  -t|--topology) run_step "Disable SMT" tune_topology ;;
   -n|--ntp) tune_ntp ;;
   -c|--cstates) tune_cstates_only ;;
-  -i|--isolate) tune_isolation_only "${ISOLATED_CORE}" ;;
+  -i|--isolate) run_step "GRUB core isolation" tune_isolation_only "${ISOLATED_CORE}" ;;
   -M|--mt-rec)
     tune_performance
     tune_memory
-    tune_security
-    enable_topology
+    run_step "Disable ASLR" tune_security
+    run_step "Enable SMT" enable_topology
     tune_ntp
     tune_mtr_grub
     ;;
   -a|--all)
     tune_performance
     tune_memory
-    tune_security
-    tune_topology
+    run_step "Disable ASLR" tune_security
+    run_step "Disable SMT" tune_topology
     tune_ntp
     tune_full_grub "${ISOLATED_CORE}"
     ;;
-  -r|--restore) restore_defaults ;;
-  -h|--help) show_help ;;
+  -r|--restore) restore_defaults || exit 1 ;;
+  -h|--help) show_help; exit 0 ;;
   *) show_help; exit 1 ;;
 esac
+
+if [ "${failures}" -gt 0 ]; then
+  if [[ "${1:-}" == "-r" || "${1:-}" == "--restore" ]]; then
+    echo "Result: PARTIALLY RESTORED (${failures} failed or unsupported steps)."
+  else
+    echo "Result: PARTIALLY APPLIED (${failures} failed or unsupported steps)."
+  fi
+  echo "Verify the system configuration before benchmarking."
+  exit 1
+fi
+echo "Result: SUCCESS."

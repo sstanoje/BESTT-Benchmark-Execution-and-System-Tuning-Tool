@@ -22,6 +22,7 @@ warn_command() {
 need_command python3
 need_command bash
 need_command sudo
+need_command flock
 
 if command -v python3 >/dev/null 2>&1; then
   if ! python3 - <<'PY' >/dev/null 2>&1
